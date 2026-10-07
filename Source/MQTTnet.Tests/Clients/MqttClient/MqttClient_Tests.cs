@@ -5,8 +5,12 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using MQTTnet.Adapter;
+using MQTTnet.Diagnostics.Logger;
 using MQTTnet.Exceptions;
 using MQTTnet.Formatter;
 using MQTTnet.Internal;
@@ -455,6 +459,34 @@ public sealed class MqttClient_Tests : BaseTestClass
     }
 
     [TestMethod]
+    public async Task KeepAlive_Ping_Send_Timeout_Raises_Disconnected()
+    {
+        var adapterFactory = new KeepAliveTimeoutAdapterFactory();
+        var disconnected = new TaskCompletionSource<MqttClientDisconnectedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var client = new MqttClientFactory().CreateMqttClient(adapterFactory);
+        client.DisconnectedAsync += eventArgs =>
+        {
+            disconnected.TrySetResult(eventArgs);
+            return CompletedTask.Instance;
+        };
+
+        var options = new MqttClientOptionsBuilder()
+            .WithTcpServer("localhost")
+            .WithKeepAlivePeriod(TimeSpan.FromSeconds(1))
+            .Build();
+
+        await client.ConnectAsync(options);
+
+        await adapterFactory.Adapter.PingRequestReceived.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var disconnectedEventArgs = await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.IsTrue(disconnectedEventArgs.ClientWasConnected);
+        Assert.IsInstanceOfType<OperationCanceledException>(disconnectedEventArgs.Exception);
+        Assert.IsFalse(client.IsConnected);
+    }
+
+    [TestMethod]
     public async Task Publish_QoS_1_In_ApplicationMessageReceiveHandler()
     {
         using var testEnvironment = new TestEnvironment(TestContext);
@@ -869,5 +901,190 @@ public sealed class MqttClient_Tests : BaseTestClass
         Assert.IsTrue(messageReceived);
         Assert.IsTrue(client1.TryPingAsync().GetAwaiter().GetResult());
         Assert.IsFalse(disconnectedFired);
+    }
+
+    // Regression test for issue #2079.
+    // A late PUBACK (one whose matching publish request was already cancelled or timed
+    // out client-side) must NOT raise a protocol violation and must NOT disconnect the
+    // client. Before the fix, the client received the late PUBACK, failed to find a
+    // waiter and threw a MqttProtocolViolationException, tearing down the connection.
+    [TestMethod]
+    [DataRow(MqttQualityOfServiceLevel.AtLeastOnce)]
+    [DataRow(MqttQualityOfServiceLevel.ExactlyOnce)]
+    public async Task Cancelled_Publish_Does_Not_Disconnect_Client(MqttQualityOfServiceLevel qos)
+    {
+        using var testEnvironment = new TestEnvironment(TestContext);
+        var server = await testEnvironment.StartServer();
+
+        // Delay the broker's acknowledgement long enough for the publish caller to give
+        // up. When the caller's cancellation token fires the awaitable is removed; the
+        // (slightly later) PUBACK / PUBREC then arrives without a matching waiter.
+        server.InterceptingPublishAsync += async e =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None);
+        };
+
+        var client = await testEnvironment.ConnectClient();
+
+        var disconnected = false;
+        client.DisconnectedAsync += _ =>
+        {
+            disconnected = true;
+            return CompletedTask.Instance;
+        };
+
+        var message = new MqttApplicationMessageBuilder().WithTopic("late-ack").WithQualityOfServiceLevel(qos).Build();
+
+        using (var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250)))
+        {
+            await Assert.ThrowsExactlyAsync<MqttCommunicationTimedOutException>(() => client.PublishAsync(message, cts.Token));
+        }
+
+        // Wait long enough for the delayed broker acknowledgement to come back.
+        await Task.Delay(TimeSpan.FromSeconds(3));
+
+        Assert.IsFalse(disconnected, "Client must not disconnect when a late acknowledgement arrives.");
+        Assert.IsTrue(client.IsConnected, "Client must still be connected after a late acknowledgement.");
+
+        // The connection must remain usable for further publishes.
+        var followUp = new MqttApplicationMessageBuilder().WithTopic("late-ack").WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce).Build();
+        await client.PublishAsync(followUp);
+    }
+
+    // Regression test for issue #2078.
+    // The MqttClient must support concurrent publishes from multiple threads without
+    // dropping messages, mismatching acknowledgements or disconnecting the client.
+    [TestMethod]
+    [DataRow(MqttQualityOfServiceLevel.AtMostOnce)]
+    [DataRow(MqttQualityOfServiceLevel.AtLeastOnce)]
+    [DataRow(MqttQualityOfServiceLevel.ExactlyOnce)]
+    public async Task Concurrent_Publish_From_Multiple_Threads(MqttQualityOfServiceLevel qos)
+    {
+        const int Threads = 8;
+        const int MessagesPerThread = 250;
+
+        using var testEnvironment = new TestEnvironment(TestContext);
+        await testEnvironment.StartServer();
+
+        var publisher = await testEnvironment.ConnectClient();
+
+        var subscriber = await testEnvironment.ConnectClient();
+        var receivedCount = 0;
+        subscriber.ApplicationMessageReceivedAsync += _ =>
+        {
+            Interlocked.Increment(ref receivedCount);
+            return CompletedTask.Instance;
+        };
+        await subscriber.SubscribeAsync("concurrent/#", qos);
+
+        var disconnected = false;
+        publisher.DisconnectedAsync += _ =>
+        {
+            disconnected = true;
+            return CompletedTask.Instance;
+        };
+
+        var tasks = Enumerable.Range(0, Threads).Select(threadIndex => Task.Run(async () =>
+        {
+            for (var i = 0; i < MessagesPerThread; i++)
+            {
+                var message = new MqttApplicationMessageBuilder()
+                    .WithTopic($"concurrent/{threadIndex}/{i}")
+                    .WithPayload(BitConverter.GetBytes(i))
+                    .WithQualityOfServiceLevel(qos)
+                    .Build();
+
+                await publisher.PublishAsync(message);
+            }
+        })).ToArray();
+
+        await Task.WhenAll(tasks);
+
+        // Allow the broker to deliver any in-flight messages to the subscriber.
+        SpinWait.SpinUntil(() => receivedCount >= Threads * MessagesPerThread, TimeSpan.FromSeconds(30));
+
+        Assert.IsFalse(disconnected, "Publisher must not disconnect during concurrent publishes.");
+        Assert.IsTrue(publisher.IsConnected);
+        Assert.AreEqual(Threads * MessagesPerThread, receivedCount);
+    }
+
+    sealed class KeepAliveTimeoutAdapterFactory : IMqttClientAdapterFactory
+    {
+        public KeepAliveTimeoutAdapter Adapter { get; private set; }
+
+        public IMqttChannelAdapter CreateClientAdapter(MqttClientOptions options, MqttPacketInspector packetInspector, IMqttNetLogger logger)
+        {
+            Adapter = new KeepAliveTimeoutAdapter(options.ProtocolVersion, options.WriterBufferSize, options.WriterBufferSizeMax);
+            return Adapter;
+        }
+    }
+
+    sealed class KeepAliveTimeoutAdapter : IMqttChannelAdapter
+    {
+        int _connAckReturned;
+
+        public KeepAliveTimeoutAdapter(MqttProtocolVersion protocolVersion, int writerBufferSize, int writerBufferSizeMax)
+        {
+            PacketFormatterAdapter = new MqttPacketFormatterAdapter(protocolVersion, new MqttBufferWriter(writerBufferSize, writerBufferSizeMax));
+        }
+
+        public long BytesReceived { get; }
+
+        public long BytesSent { get; }
+
+        public X509Certificate2 ClientCertificate { get; }
+
+        public EndPoint RemoteEndPoint { get; } = new DnsEndPoint("localhost", 1883);
+
+        public EndPoint LocalEndPoint { get; } = new DnsEndPoint("localhost", 0);
+
+        public bool IsSecureConnection { get; }
+
+        public MqttPacketFormatterAdapter PacketFormatterAdapter { get; }
+
+        public TaskCompletionSource PingRequestReceived { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task ConnectAsync(CancellationToken cancellationToken)
+        {
+            return CompletedTask.Instance;
+        }
+
+        public Task DisconnectAsync(CancellationToken cancellationToken)
+        {
+            return CompletedTask.Instance;
+        }
+
+        public void Dispose()
+        {
+        }
+
+        public async Task<MqttPacket> ReceivePacketAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Exchange(ref _connAckReturned, 1) == 0)
+            {
+                return new MqttConnAckPacket
+                {
+                    ReturnCode = MqttConnectReturnCode.ConnectionAccepted
+                };
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return null;
+        }
+
+        public void ResetStatistics()
+        {
+        }
+
+        public Task SendPacketAsync(MqttPacket packet, CancellationToken cancellationToken)
+        {
+            if (packet is MqttPingReqPacket)
+            {
+                PingRequestReceived.TrySetResult();
+                return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+
+            return CompletedTask.Instance;
+        }
     }
 }
